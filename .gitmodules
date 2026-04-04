@@ -1,0 +1,3 @@
+[submodule "snick_python"]
+	path = snick_python
+	url = https://github.com/jjj7632/snick-python
