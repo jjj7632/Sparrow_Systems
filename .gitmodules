@@ -1,3 +1,6 @@
 [submodule "snick_python"]
 	path = snick_python
 	url = https://github.com/jjj7632/snick-python.git
+[submodule "pc_image_cache"]
+	path = pc_image_cache
+	url = https://github.com/jjj7632/pc_image_cache.git
