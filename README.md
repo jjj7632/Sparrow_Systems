@@ -12,7 +12,9 @@ Hawkeye, a system previously used by the United States Tennis Association [USTA]
 ## Repo
 
 - `snick_python/`: SoC side Python protocol and TCP scaffolding
-- `to_do/`: Matlab side of things
+- `pc_image_cache/`: PC/MATLAB-side replay cache scaffolding
+- `shared_protocol/`: shared TCP command/image protocol helpers
+- `fpga/`: AXI/DMA integration contract and detector IP stub notes
 
 ## Current Defaults
 
