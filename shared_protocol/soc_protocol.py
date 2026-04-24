@@ -20,16 +20,27 @@ CMD_SLAVE_MODE_READY = 99
 MODE_MASTER = "master"
 MODE_SLAVE = "slave"
 
+MAX_FAST_DEPTH_M = 50.0
+MAX_FAST_ABS_X_M = 20.0
+MAX_FAST_ABS_Y_M = 20.0
+MAX_FAST_POSITION_JUMP_M = 5.0
+
+COURT_HALF_WIDTH_M = 4.115
+COURT_HALF_LENGTH_M = 11.885
+COURT_OUT_MARGIN_M = 0.15
+
 
 class SoCProtocol(object):
-    # Initialize SoC mode, the capture state, and the outbound commands
-    def __init__(self, command_sender=None, fpga_cache=None):
+    # Initialize SoC mode, the capture state and the outbound commands
+    def __init__(self, command_sender=None, fpga_cache=None, disable_fpga_fast_path=False):
         self.mode = MODE_MASTER
         self.latest_frame = LatestFrameStore()
         self.capture_enabled = True
         self.command_sender = command_sender
         self.waiting_for_image = False
         self.fpga_cache = fpga_cache
+        self.disable_fpga_fast_path = disable_fpga_fast_path
+        self.last_good_position = None
 
     # Send a command outward through the configured transport callback
     def send_command(self, cmd_array):
@@ -78,52 +89,114 @@ class SoCProtocol(object):
         self.send_command([CMD_STOP_CAPTURE])
         self.enter_slave_mode()
 
-    # Signal that the SoC is ready for slave-mode replay commands
+    # Signal that the SoC is ready for slave mode replay commands
     def send_slave_mode_ready(self):
         self.send_command([CMD_SLAVE_MODE_READY])
 
     # Run the fast primary processing path used in master mode
-    def fast_process_image(self, frame_number, image_data):
-        # TODO:
-        """
-        # 1. Send the image info to the FPGA fast path
-                - this requires setting up DDR, probably utilizing AXI-Lite for actual image caching
-                  so that the fpga can read (Josh is working on this as his next task)
-                        a.) allocate a 2 DDR frame ping pong buffer that Python can fille and FPGA can read from
-                        b.) copy the latest image into it
-                        c.) store its physical address
-                        d.) write that address to FPGA registers
-                        e.) trigger the FPGA
-        # 2. Read back the FPGA estimated ball position
-        # 3. Convert the FPGA output into x/y/z values in Python
-        # 4. Check whether the FPGA result is reasonable compared to recent history
-        # 5. Flag whether the result should be sent to the fallback path
-        # 6. Flag whether this frame looks like a possible out call
-        # 7. Return the frame number, x/y/z position, reasonableness, and likely_out status
-        """
+    def is_fast_position_reasonable(self, x, y, z):
+        if z <= 0.0 or z > MAX_FAST_DEPTH_M:
+            return False
+        if abs(x) > MAX_FAST_ABS_X_M or abs(y) > MAX_FAST_ABS_Y_M:
+            return False
 
+        if self.last_good_position is not None:
+            dx = x - self.last_good_position["x"]
+            dy = y - self.last_good_position["y"]
+            dz = z - self.last_good_position["z"]
+            jump = (dx * dx + dy * dy + dz * dz) ** 0.5
+            if jump > MAX_FAST_POSITION_JUMP_M:
+                return False
+
+        return True
+
+    # MVP out trigger next step #TODO is to prolly replace with camera to court transform
+    def is_likely_out_fast(self, x, z):
+        return (
+            abs(x) > COURT_HALF_WIDTH_M + COURT_OUT_MARGIN_M or
+            abs(z) > COURT_HALF_LENGTH_M + COURT_OUT_MARGIN_M
+        )
+
+    def remember_good_fast_position(self, frame_number, x, y, z):
+        self.last_good_position = {
+            "frame_number": frame_number,
+            "x": x,
+            "y": y,
+            "z": z
+        }
+
+    def fast_process_image(self, frame_number, image_data):
+        # Master mode fast path - 
+        #  Submits the paired stereo frame to FPGAaccessible DDR buffers
+        #  Lets the FPGA run the red channel subtraction/threshold candidate detector
+        #  Read back image space stereo centroids and convert them to world space XYZ
+        #  Mark unreliable results for fallback and suspicious results for out call confirmation
         if self.fpga_cache is None:
             raise RuntimeError("fpga_cache must be configured with a DMA backed PingPongFpgaCache")
 
+        # Frame 0 is special, it updates the persistent base image instead of processing a shot
         self.fpga_cache.submit_frame(frame_number=frame_number, image_data=image_data)
         result = self.fpga_cache.read_result()
 
-        print(result)
+        # Base image updates are successful calibration events not ball detections
+        if result.get("base_updated", False):
+            self.last_good_position = None
+            return {
+                "frame_number": frame_number,
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "reasonable": True,
+                "likely_out": False,
+                "base_updated": True
+            }
         
-        
-        # Reasonable Logic... blah blah blah
-        reasonable = True
+        # If the FPGA did not find a valid stereo candidate run the software fallback
+        if not result.get("candidate_valid", False):
+            fallback_result = self.fallback_process_image(frame_number, image_data)
+            fallback_result["fpga_status"] = result.get("status", 0)
+            fallback_result["fpga_candidate_valid"] = False
+            print("[FPGA] No valid FPGA candidate using CPU fallback:", fallback_result)
+            return fallback_result
 
-        # Likely out Logic... blah blah blah
-        likely_out = False
+        # The FPGA returns pixel centroids from the accelerated red channel detector
+        FOCAL_PX = 10.0 / 0.006
+        CX = 1920 / 2.0
+        CY = 1080 / 2.0
+        BASELINE = 0.10
+
+        u_left = result["left_x"]
+        v_left = result["left_y"]
+        u_right = result["right_x"]
+        disparity = u_left - u_right
+
+        # Very small or negative disparity means the stereo depth estimate cannot be trusted
+        if disparity <= 1.0:
+            fallback_result = self.fallback_process_image(frame_number, image_data)
+            fallback_result["fpga_status"] = result.get("status", 0)
+            fallback_result["fpga_candidate_valid"] = True
+            return fallback_result
+
+        z = (FOCAL_PX * BASELINE) / disparity
+        x = (u_left - CX) * z / FOCAL_PX
+        y = (v_left - CY) * z / FOCAL_PX
+        
+        # Reasonable decides whether the fast result is trusted or should fall back to Python
+        reasonable = self.is_fast_position_reasonable(x, y, z)
+
+        # likely_out is only a trigger, backtracking should make the final in/out call
+        likely_out = reasonable and self.is_likely_out_fast(x, z)
+        if reasonable:
+            self.remember_good_fast_position(frame_number, x, y, z)
 
         return {
             "frame_number": frame_number,
-            "x": result["x"],
-            "y": result["y"],
-            "z": result["z"],
+            "x": x,
+            "y": y,
+            "z": z,
             "reasonable": reasonable,
-            "likely_out": likely_out
+            "likely_out": likely_out,
+            "base_updated": False
         }
 
     # Run the slower fallback processing path used for replay or bad calls
@@ -135,25 +208,33 @@ class SoCProtocol(object):
 
     # Run the slower fallback processing path used for replay or bad calls
     def fallback_process_image(self, frame_number, image_data):
-        # Camera constants
+        # CPU fallback path - 
+        #  Use color thresholding to find the ball in both images
+        #  Pick the most circular contour as the ball candidate
+        #  Convert the stereo pixel locations into world-space XYZ
+
+        # Camera constants for converting stereo image space disparity into XYZ
         FOCAL_PX = 10.0 / 0.006
         CX       = 1920 / 2.0
         CY       = 1080 / 2.0
         BASELINE = 0.10
 
+        # fallback path assumes MATLAB/PC cache already paired the left and right frames
         frame_num, left_image, right_image = self.extract_stereo_pair(frame_number, image_data)
 
-        # Convert to HSV and threshold to isolate tennis ball yellow-green pixels
+        # Convert to HSV and threshold to isolate tennis ball yellow green pixels
         hsv_lower = np.array([25, 80, 80],   dtype=np.uint8)
         hsv_upper = np.array([65, 255, 255], dtype=np.uint8)
         left_mask  = cv2.inRange(cv2.cvtColor(left_image,  cv2.COLOR_RGB2HSV), hsv_lower, hsv_upper)
         right_mask = cv2.inRange(cv2.cvtColor(right_image, cv2.COLOR_RGB2HSV), hsv_lower, hsv_upper)
 
-        # Find the most circular contour in the mask and return its pixel centroid
+        # find the most circular contour in the mask and return its pixel centroid
         def get_centroid(mask):
+            # Closing fills small gaps in the ball mask before contour extraction
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
             mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
+            # Contours give connected candidate blobs in the thresholded mask
             contour_result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             contours = contour_result[-2]
             best, best_score = None, 0.0
@@ -162,6 +243,8 @@ class SoCProtocol(object):
                 perimeter = cv2.arcLength(c, True)
                 if area < 50 or perimeter == 0:       # raised from 20 to 50
                     continue
+
+                # Circularity filters out irregular blobs that are unlikely to be the ball
                 circularity = (4.0 * np.pi * area) / (perimeter ** 2)
                 if circularity > best_score:
                     best, best_score = c, circularity
@@ -187,6 +270,7 @@ class SoCProtocol(object):
         if disparity <= 1.0:
             return {"frame_number": frame_num, "x": 0.0, "y": 0.0, "z": 0.0, "reasonable": False, "likely_out": False}
 
+        # Stereo x/y come from the left image centroid, z comes from disparity
         z = (FOCAL_PX * BASELINE) / disparity
         x = (u_left - CX) * z / FOCAL_PX
         y = (v_left - CY) * z / FOCAL_PX
@@ -211,6 +295,7 @@ class SoCProtocol(object):
         self.mode = MODE_MASTER
         self.capture_enabled = True
         self.waiting_for_image = False
+        self.last_good_position = None
 
     def perform_backtracking_procedure(self, frame_number):
 
@@ -232,16 +317,21 @@ class SoCProtocol(object):
             "confirmed_out": True
         }
 
-    # Process one inbound image using the mode-appropriate algorithm path
+    # Process one inbound image using the mode appropriate algorithm path
     def handle_process_image(self, frame_number, image_data):
         self.waiting_for_image = False
         self.latest_frame.put(frame_number, image_data)
 
         if self.mode == MODE_MASTER:
             print("Processing in MASTER mode")
-            result = self.fast_process_image(frame_number, image_data)
-            result["used_fallback"] = False
-            if not result.get("reasonable", True):
+            use_fpga_path = not self.disable_fpga_fast_path or frame_number == 0
+            if use_fpga_path:
+                result = self.fast_process_image(frame_number, image_data)
+                result["used_fallback"] = False
+                if not result.get("reasonable", True):
+                    result = self.fallback_process_image(frame_number, image_data)
+                    result["used_fallback"] = True
+            else:
                 result = self.fallback_process_image(frame_number, image_data)
                 result["used_fallback"] = True
         else:
