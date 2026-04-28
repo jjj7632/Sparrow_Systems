@@ -91,11 +91,11 @@ class NumpySocket(object):
         if not isinstance(frame, np.ndarray):
             raise TypeError("input frame is not a valid numpy array")
 
-        frame = np.ascontiguousarray(frame, dtype=self.image_dtype)
+        frame = np.asarray(frame, dtype=self.image_dtype, order="F")
         if frame.size != int(np.prod(self.image_shape, dtype=np.int64)):
             raise ValueError("input frame size does not match configured image_shape")
         socket_obj = self.activeSocket()
-        socket_obj.sendall(frame.tobytes(order="C"))
+        socket_obj.sendall(frame.tobytes(order="F"))
 
     # Receive a fixed size image buffer and reshape it to the configured size
     def receive(self):
@@ -108,7 +108,7 @@ class NumpySocket(object):
             return None
 
         frame = np.frombuffer(frame_buffer, dtype=self.image_dtype)
-        return frame.reshape(self.image_shape)
+        return frame.reshape(self.image_shape, order="F")
 
     # Send a one byte command value
     def sendCmd(self, cmd):
@@ -131,6 +131,17 @@ class NumpySocket(object):
         if data is None:
             return None
         return struct.unpack("!i", data)[0]
+
+    # Send an unsigned 32-bit integer value
+    def sendUint32(self, value):
+        self.activeSocket().sendall(struct.pack("!I", int(value)))
+
+    # Receive an unsigned 32-bit integer value
+    def receiveUint32(self):
+        data = self.recvExact(4)
+        if data is None:
+            return None
+        return struct.unpack("!I", data)[0]
 
     # Send an unsigned 8-bit integer value
     def sendUint8(self, value):

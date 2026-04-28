@@ -32,17 +32,6 @@ class LatestFrameStore(object):
             "timestamp": self.timestamp
         }
 
-    # Drop any stored frame data from the cache
-    def clear(self):
-        self.frame_number = None
-        self.image_data = None
-        self.timestamp = None
-
-    # Report whether a frame has been stored yet
-    def is_empty(self):
-        return self.image_data is None
-
-
 def create_dummy_image(width, height, value, channels=1):
     if width <= 0 or height <= 0:
         raise ValueError("width and height must be positive")
