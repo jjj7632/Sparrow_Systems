@@ -42,6 +42,7 @@ MAX_FAST_HISTORY_GAP_FRAMES = 20
 BOUNCE_Y_WINDOW_M = 0.35
 BOUNCE_Y_DELTA_MIN_M = 0.03
 BOUNCE_TOUCH_Y_MAX_M = 0.08
+BOUNCE_TRACK_LOSS_WINDOW_POINTS = 4
 
 COURT_HALF_WIDTH_M = 4.115
 COURT_HALF_LENGTH_M = 11.885
@@ -295,6 +296,51 @@ class SoCProtocol(object):
         within_width = abs(z) <= COURT_HALF_WIDTH_M
         return within_length and within_width
 
+    # If the ball disappears right after getting down to the court this tries to save the bounce
+    # We only use this on the first missing frame so one dropout does not hide an otherwise obvious contact
+    def find_track_loss_bounce_candidate(self, frame_number):
+        if len(self.recent_positions) < 3:
+            return None
+
+        window = [
+            {"frame_number": point["frame_number"], "x": point["x"], "y": point["y"], "z": point["z"]}
+            for point in self.recent_positions[-BOUNCE_TRACK_LOSS_WINDOW_POINTS:]
+        ]
+
+        for idx in range(1, len(window)):
+            if (window[idx]["frame_number"] - window[idx - 1]["frame_number"]) > MAX_FAST_HISTORY_GAP_FRAMES:
+                return None
+
+        last_valid = window[-1]
+        previous_valid = window[-2]
+        expected_gap = last_valid["frame_number"] - previous_valid["frame_number"]
+        if expected_gap <= 0:
+            expected_gap = 10
+        if (frame_number - last_valid["frame_number"]) > expected_gap:
+            return None
+
+        min_index = min(range(len(window)), key=lambda idx: window[idx]["y"])
+        bounce = window[min_index]
+
+        # If the low point happened too far back then this dropout probably is not the bounce itself
+        if min_index < (len(window) - 2):
+            return None
+
+        near_court = abs(bounce["y"]) <= BOUNCE_Y_WINDOW_M
+        has_descent_before = any(
+            (point["y"] - bounce["y"]) >= BOUNCE_Y_DELTA_MIN_M
+            for point in window[:min_index]
+        )
+        touches_court_plane = (
+            bounce["y"] <= BOUNCE_TOUCH_Y_MAX_M or
+            (any(point["y"] <= 0 for point in window) and any(point["y"] >= 0 for point in window))
+        )
+
+        if not (near_court and has_descent_before and touches_court_plane):
+            return None
+
+        return bounce
+
     # Keep a short recent trail so bounce detection has something to work with
     def remember_good_fast_position(self, frame_number, x, y, z):
         position = {
@@ -318,17 +364,19 @@ class SoCProtocol(object):
         result["bounce"] = None
 
         if x == FAST_NOT_FOUND_VALUE and y == FAST_NOT_FOUND_VALUE and z == FAST_NOT_FOUND_VALUE:
+            result["bounce"] = self.find_track_loss_bounce_candidate(frame_number)
             result["reasonable"] = False
-            result["likely_out"] = False
+            result["likely_out"] = result["bounce"] is not None
             return result
 
         final_reasonable = bool(result.get("reasonable", False)) and self.is_position_reasonable(frame_number, x, y, z)
         result["reasonable"] = final_reasonable
         if not final_reasonable:
+            result["bounce"] = self.find_track_loss_bounce_candidate(frame_number)
             result["x"] = FAST_NOT_FOUND_VALUE
             result["y"] = FAST_NOT_FOUND_VALUE
             result["z"] = FAST_NOT_FOUND_VALUE
-            result["likely_out"] = False
+            result["likely_out"] = result["bounce"] is not None
             return result
 
         bounce = self.find_recent_bounce_candidate(frame_number, x, y, z)
