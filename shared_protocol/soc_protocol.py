@@ -33,6 +33,7 @@ MODE_SLAVE = "slave"
 MAX_FAST_DEPTH_M = 50.0
 MAX_FAST_ABS_X_M = 20.0
 MAX_FAST_ABS_Y_M = 20.0
+MAX_FAST_ABS_Z_M = 20.0
 MAX_FAST_POSITION_JUMP_M = 5.0
 MAX_FAST_X_STEP_PER_10_FRAMES_M = 2.0
 MAX_FAST_Y_STEP_PER_10_FRAMES_M = 1.0
@@ -71,6 +72,7 @@ FAST_CIRC_THRESHOLD = 50
 FAST_MIN_SIZE = 8
 FAST_MAX_SIZE = 45
 FAST_SQUARE_TOL = 14
+CV2_RED_CHANNEL_INDEX = 2
 FALLBACK_FAST_CIRC_THRESHOLD = 35
 FALLBACK_FAST_MIN_SIZE = 8
 FALLBACK_FAST_MAX_SIZE = 45
@@ -109,6 +111,7 @@ class SoCProtocol(object):
         self.fast_base_left = None
         self.fast_base_right = None
         self.fast_base_preload_attempted = False
+        self.fast_base_source = None
         self.last_bounce_reported_frame = None
         # These keep noisy hardware errors from spamming the console every frame
         self.warned_missing_fpga_cache = False
@@ -197,7 +200,7 @@ class SoCProtocol(object):
             return False
 
         abs_z = abs(z)
-        if z >= 0.0 or abs_z > MAX_FAST_DEPTH_M:
+        if abs_z > MAX_FAST_ABS_Z_M:
             return False
         if abs(x) > MAX_FAST_ABS_X_M or abs(y) > MAX_FAST_ABS_Y_M:
             return False
@@ -364,34 +367,75 @@ class SoCProtocol(object):
             return np.ascontiguousarray(image[:, :, 0], dtype=np.uint8)
         return np.ascontiguousarray(image, dtype=np.uint8)
 
-    # Try to grab the canned frame 40 base images from disk
-    # This keeps the fast path consistent even if a live run starts in the middle of the sequence
-    def try_preload_fast_base_images(self):
-        if self.fast_base_preload_attempted:
-            return self.fast_base_left is not None and self.fast_base_right is not None
-
-        self.fast_base_preload_attempted = True
+    # Search the repo for frame 40 stereo pairs and pick the one that best matches the current scene
+    def select_preload_fast_base_images(self, left_reference=None, right_reference=None):
         repo_root = Path(__file__).resolve().parents[1]
-        left_path = None
-        right_path = None
-        for ext in (".jpg", ".jpeg", ".png"):
-            candidate_left = repo_root / "serve1" / ("LeftFrame_%d%s" % (FAST_PRELOAD_BASE_FRAME, ext))
-            candidate_right = repo_root / "serve1" / ("RightFrame_%d%s" % (FAST_PRELOAD_BASE_FRAME, ext))
-            if candidate_left.is_file() and candidate_right.is_file():
-                left_path = candidate_left
-                right_path = candidate_right
-                break
+        candidate_pairs = []
+        search_roots = [repo_root]
+        for child in sorted(repo_root.iterdir()):
+            if child.is_dir():
+                search_roots.append(child)
 
-        if left_path is None or right_path is None:
-            return False
+        for folder in search_roots:
+            for ext in (".jpg", ".jpeg", ".png"):
+                candidate_left = folder / ("LeftFrame_%d%s" % (FAST_PRELOAD_BASE_FRAME, ext))
+                candidate_right = folder / ("RightFrame_%d%s" % (FAST_PRELOAD_BASE_FRAME, ext))
+                if candidate_left.is_file() and candidate_right.is_file():
+                    candidate_pairs.append((folder, candidate_left, candidate_right))
+                    break
+
+        if not candidate_pairs:
+            return None
+
+        if left_reference is None or right_reference is None:
+            folder, left_path, right_path = candidate_pairs[0]
+        else:
+            left_reference = np.asarray(left_reference, dtype=np.uint8)
+            right_reference = np.asarray(right_reference, dtype=np.uint8)
+            left_reference = left_reference[::8, ::8]
+            right_reference = right_reference[::8, ::8]
+            best_choice = None
+            best_score = None
+            for folder, left_path, right_path in candidate_pairs:
+                left_image = cv2.imread(str(left_path), cv2.IMREAD_COLOR)
+                right_image = cv2.imread(str(right_path), cv2.IMREAD_COLOR)
+                if left_image is None or right_image is None:
+                    continue
+                left_candidate = np.ascontiguousarray(left_image[:, :, CV2_RED_CHANNEL_INDEX], dtype=np.uint8)[::8, ::8]
+                right_candidate = np.ascontiguousarray(right_image[:, :, CV2_RED_CHANNEL_INDEX], dtype=np.uint8)[::8, ::8]
+                score = float(np.mean(np.abs(left_reference.astype(np.int16) - left_candidate.astype(np.int16))))
+                score += float(np.mean(np.abs(right_reference.astype(np.int16) - right_candidate.astype(np.int16))))
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_choice = (folder, left_path, right_path)
+            if best_choice is None:
+                return None
+            folder, left_path, right_path = best_choice
 
         left_image = cv2.imread(str(left_path), cv2.IMREAD_COLOR)
         right_image = cv2.imread(str(right_path), cv2.IMREAD_COLOR)
         if left_image is None or right_image is None:
-            return False
+            return None
 
-        self.fast_base_left = np.ascontiguousarray(left_image[:, :, 2], dtype=np.uint8)
-        self.fast_base_right = np.ascontiguousarray(right_image[:, :, 2], dtype=np.uint8)
+        left_base = np.ascontiguousarray(left_image[:, :, CV2_RED_CHANNEL_INDEX], dtype=np.uint8)
+        right_base = np.ascontiguousarray(right_image[:, :, CV2_RED_CHANNEL_INDEX], dtype=np.uint8)
+        return folder, left_base, right_base
+
+    # Try to grab a matching frame 40 stereo base from disk
+    # This keeps the fast path aligned with the current dataset instead of hardwiring serve1
+    def try_preload_fast_base_images(self, left_reference=None, right_reference=None):
+        if self.fast_base_left is not None and self.fast_base_right is not None:
+            return True
+        if self.fast_base_preload_attempted and left_reference is None and right_reference is None:
+            return False
+        choice = self.select_preload_fast_base_images(left_reference=left_reference, right_reference=right_reference)
+        self.fast_base_preload_attempted = True
+        if choice is None:
+            return False
+        folder, left_base, right_base = choice
+        self.fast_base_left = left_base
+        self.fast_base_right = right_base
+        self.fast_base_source = str(folder)
         return True
 
     # Take a binary mask and look for something that feels like the ball
@@ -579,7 +623,11 @@ class SoCProtocol(object):
         return mask
 
     # Score hsv blobs and prefer the one that looks both round and close to where the last one was
-    def centroid_from_hsv_fallback_mask(self, mask, previous_centroid=None):
+    def centroid_from_hsv_fallback_mask(
+        self,
+        mask,
+        previous_centroid=None,
+    ):
         mask = np.asarray(mask, dtype=np.uint8)
         open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
@@ -730,7 +778,7 @@ class SoCProtocol(object):
         right_channel = self.extract_fast_channel(right_image)
 
         if self.fast_base_left is None or self.fast_base_right is None:
-            self.try_preload_fast_base_images()
+            self.try_preload_fast_base_images(left_channel, right_channel)
 
         if self.fast_base_left is None or self.fast_base_right is None or frame_number == 0:
             self.fast_base_left = left_channel.copy()
