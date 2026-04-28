@@ -895,22 +895,8 @@ class SoCProtocol(object):
         }
 
     # This is the normal rescue path when the main detector is unhappy
-    # It first tries a looser base subtraction pass and only then drops to hsv only
+    # Keep this pure hsv so the backup path stays clearly different from the fast subtraction path
     def fallback_process_image(self, frame_number, image_data):
-        frame_num, left_image, right_image = self.extract_stereo_pair(frame_number, image_data)
-
-        if self.fast_base_left is None or self.fast_base_right is None:
-            self.try_preload_fast_base_images()
-
-        if self.fast_base_left is not None and self.fast_base_right is not None:
-            left_channel = self.extract_fast_channel(left_image)
-            right_channel = self.extract_fast_channel(right_image)
-            left_match = self.detect_fallback_fast_match_from_raw(self.fast_base_left, left_channel)
-            right_match = self.detect_fallback_fast_match_from_raw(self.fast_base_right, right_channel)
-            if left_match is not None and right_match is not None:
-                fallback_fast_result = self.fast_matches_to_world(frame_num, left_match, right_match)
-                return fallback_fast_result
-
         return self.hsv_fallback_process_image(frame_number, image_data)
 
     # Slave mode means Matlab chooses the frames instead of us constantly asking for the newest one
