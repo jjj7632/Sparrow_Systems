@@ -438,8 +438,8 @@ class SoCProtocol(object):
         if left_reference is None or right_reference is None:
             folder, left_path, right_path = candidate_pairs[0]
         else:
-            left_reference = np.asarray(left_reference, dtype=np.uint8)
-            right_reference = np.asarray(right_reference, dtype=np.uint8)
+            left_reference = self.extract_fast_channel(left_reference)
+            right_reference = self.extract_fast_channel(right_reference)
             left_reference = left_reference[::8, ::8]
             right_reference = right_reference[::8, ::8]
             best_choice = None
